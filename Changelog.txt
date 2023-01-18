@@ -1,0 +1,10 @@
+Changelog
+
+0.8.0
+	Adoption by Linuxgurugamer
+	Added support for Universal Storage 2
+	Added InstallChecker
+	Added AssemblyVersion.tt
+	Moved dll into Plugins folder
+	Added Dependency
+		SpaceTuxLibrary

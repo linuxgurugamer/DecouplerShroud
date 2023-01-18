@@ -1,4 +1,6 @@
 ﻿using UnityEngine;
+using UniversalStorage2;
+using SpaceTuxUtility;
 
 namespace DecouplerShroud {
 	class ModuleDecouplerScaler : PartModule, IPartMassModifier, IPartCostModifier {
@@ -51,13 +53,26 @@ namespace DecouplerShroud {
 
 			partMass = Mathf.Round(1000*diameter * diameter * massPerMeterSquared)/1000;
 			partCost = Mathf.Round(costPerMeter * diameter + baseCost);
-			if (GetComponent<ModuleDecouple>() != null) {
+			if (GetComponent<ModuleDecouple>() != null)
+			{
 				GetComponent<ModuleDecouple>().ejectionForce = diameter * ejectionForcePerMeter;
+			}
+			else
+				US2EjectionForce();
+        }
+
+		void US2EjectionForce()
+		{
+			if (SpaceTuxUtility.HasMod.hasMod("UniversalStorage2"))
+			{
+				if (GetComponent<USDecouple>() != null)
+				{
+					GetComponent<USDecouple>().ejectionForce = diameter * ejectionForcePerMeter;
+				}
 			}
 		}
 
-
-		public float GetModuleMass(float defaultMass, ModifierStagingSituation sit) {
+        public float GetModuleMass(float defaultMass, ModifierStagingSituation sit) {
 			return  partMass - defaultMass;
 		}
 
