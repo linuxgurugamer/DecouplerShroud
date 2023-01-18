@@ -36,7 +36,7 @@
 # 3:SOURCEFILE, DESTDIR
 3:DecouplerShroud.version,GameData/DecouplerShroud
 3:LICENSE.md,GameData/DecouplerShroud
-#3:README.md,GameData/DecouplerShroud
+3:README.md,GameData/DecouplerShroud
 
 # 4:SOURCDIR, DESTDIR
 #4:Textures,GameData/ManeuverQueue/Textures

@@ -26,7 +26,7 @@ rem README is the readme file
 set GAMEDIR=DecouplerShroud
 set GAMEDATA="GameData\"
 set VERSIONFILE=%GAMEDIR%.version
-set LICENSE=LICENSE
+set LICENSE=LICENSE.md
 rem set README=ReadMe.md
 
 set RELEASEDIR=d:\Users\jbb\release

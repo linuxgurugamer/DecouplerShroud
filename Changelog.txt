@@ -8,3 +8,7 @@ Changelog
 	Moved dll into Plugins folder
 	Added Dependency
 		SpaceTuxLibrary
+	Updated version file
+	Updated license file name
+	Deleted DLLs from repo
+	Added small README.md with instructions
