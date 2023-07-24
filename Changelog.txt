@@ -1,14 +1,17 @@
 Changelog
 
+0.8.1
+	Fixed checking for availability of call to US2 to outside mod to avoid FileNotFound exceptions
+
 0.8.0
 	Adoption by Linuxgurugamer
 	Added support for Universal Storage 2
 	Added InstallChecker
 	Added AssemblyVersion.tt
 	Moved dll into Plugins folder
-	Added Dependency
-		SpaceTuxLibrary
 	Updated version file
 	Updated license file name
 	Deleted DLLs from repo
 	Added small README.md with instructions
+	Added Dependency
+		SpaceTuxLibrary
