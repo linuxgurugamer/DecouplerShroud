@@ -1,5 +1,12 @@
 Changelog
 
+0.9.0
+	Updated version file to use github for new version info
+	Thanks to @JadeOfMaar for these changes:
+		Remade textures for Default, Dark, Corrugated, Orange (SOFI), Inside (shroud inner walls), Saturn, Saturn Flat
+		Fixed missing normals path in configs: Default, Saturn Flat
+		Updated tiling config for Orange
+
 0.8.1
 	Fixed checking for availability of call to US2 to outside mod to avoid FileNotFound exceptions
 
