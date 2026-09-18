@@ -1,7 +1,6 @@
 using KSP.Localization;
 using System.Collections.Generic;
 using UnityEngine;
-using UniversalStorage2;
 
 namespace DecouplerShroud {
 	class ShroudTexture {
@@ -108,9 +107,9 @@ namespace DecouplerShroud {
                 tex.displayName = node.GetValue("displayName");
 			}
 
-			if (node.HasValue("showInVAB")) {
-				bool.TryParse(node.GetValue("showInVAB"), out tex.showInVAB);
-			}
+            if (node.HasValue("showInVAB")) {
+                bool.TryParse(node.GetValue("showInVAB"), out tex.showInVAB);
+            }
 
 			if (!node.HasNode("outside") || !node.HasNode("top") || !node.HasNode("inside")) {
 				Debug.LogError("[DecouplerShroud] texture config needs outside, top, inside nodes if no base is given. Texutre Name: " + tex.name);

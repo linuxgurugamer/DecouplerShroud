@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 using UnityEngine;
 
 
@@ -17,6 +17,9 @@ namespace DecouplerShroud {
 		Dictionary<string, Texture> textures = new Dictionary<string, Texture>();
 		Dictionary<string, float> floats = new Dictionary<string, float>();
 		Dictionary<string, Color> colors = new Dictionary<string, Color>();
+		Dictionary<string, Texture> recolorTextures = new Dictionary<string, Texture>();
+		Dictionary<string, Vector4> recolorVectors = new Dictionary<string, Vector4>();
+		public bool hasRecolorData = false;
 
 		public Vector2 scale = new Vector2(1, 1);
 
@@ -53,6 +56,9 @@ namespace DecouplerShroud {
 				textures = new Dictionary<string, Texture>(texBase.textures);
 				floats = new Dictionary<string, float>(texBase.floats);
 				colors = new Dictionary<string, Color>(texBase.colors);
+				recolorTextures = new Dictionary<string, Texture>(texBase.recolorTextures);
+				recolorVectors = new Dictionary<string, Vector4>(texBase.recolorVectors);
+				hasRecolorData = texBase.hasRecolorData;
 
 				texBaseShader = texBase.shader;
 				shader = texBase.shader;
@@ -111,6 +117,47 @@ namespace DecouplerShroud {
 			}
 		}
 
+		public void EnsureDefaultRecolorData(Color maskColor) {
+			if (!recolorTextures.ContainsKey("_MetallicGlossMap")) {
+				if (textures.ContainsKey("_MainTex")) {
+					recolorTextures.Add("_MetallicGlossMap", textures["_MainTex"]);
+				}
+			}
+			if (!recolorTextures.ContainsKey("_MaskTex")) {
+				Texture2D mask = new Texture2D(4, 4, TextureFormat.RGBA32, false);
+				Color[] pixels = new Color[16];
+				for (int i = 0; i < pixels.Length; i++) pixels[i] = maskColor;
+				mask.SetPixels(pixels);
+				mask.Apply(false, true);
+				recolorTextures.Add("_MaskTex", mask);
+			}
+			if (!recolorVectors.ContainsKey("_DiffuseNorm")) recolorVectors.Add("_DiffuseNorm", new Vector4(0.75f, 0.75f, 0.75f, 0f));
+			if (!recolorVectors.ContainsKey("_MetalNorm")) recolorVectors.Add("_MetalNorm", new Vector4(0.5f, 0.5f, 0.5f, 0f));
+			if (!recolorVectors.ContainsKey("_SmoothnessNorm")) recolorVectors.Add("_SmoothnessNorm", new Vector4(0.5f, 0.5f, 0.5f, 0f));
+			hasRecolorData = true;
+		}
+
+		public Material CreateTURecolorMaterial() {
+			Shader tuShader = getShader("TU/Metallic");
+			if (tuShader == null) {
+				Debug.LogWarning("[DecouplerShroud] TU/Metallic shader not found, cannot create TURD material");
+				return null;
+			}
+			Material tuMat = new Material(tuShader);
+			tuMat.EnableKeyword("TU_RECOLOR");
+
+			foreach (KeyValuePair<string, Texture> t in textures) {
+				if (tuMat.HasProperty(t.Key)) tuMat.SetTexture(t.Key, t.Value);
+			}
+			foreach (KeyValuePair<string, Texture> t in recolorTextures) {
+				if (tuMat.HasProperty(t.Key)) tuMat.SetTexture(t.Key, t.Value);
+			}
+			foreach (KeyValuePair<string, Vector4> t in recolorVectors) {
+				if (tuMat.HasProperty(t.Key)) tuMat.SetVector(t.Key, t.Value);
+			}
+			return tuMat;
+		}
+
 		ConfigNode selectMaterialVariant(ConfigNode node) {
 			if (node.HasNode("MaterialVariant")) {
 				foreach (ConfigNode m in node.GetNodes("MaterialVariant")) {
@@ -153,6 +200,11 @@ namespace DecouplerShroud {
 			if (mVar != null) {
 				getPropertiesFromNode(mVar);
 			}
+
+			ParseRecolorFromNode(node);
+			if (mVar != null) {
+				ParseRecolorFromNode(mVar);
+			}
 		}
 
 		void getPropertiesFromNode(ConfigNode node) {
@@ -189,6 +241,34 @@ namespace DecouplerShroud {
 			}
 
 			ParseScalingOptions(node);
+		}
+
+		void ParseRecolorFromNode(ConfigNode node) {
+			if (!node.HasNode("Recolor")) return;
+			ConfigNode rec = node.GetNode("Recolor");
+
+			foreach (string s in rec.GetValues("texture")) {
+				string[] split = s.Split(',');
+				if (split.Length < 2) {
+					Debug.LogWarning("[DecouplerShroud] Recolor texture value only has one parameter: " + s);
+					continue;
+				}
+				RemovePropertyIfExists(recolorTextures, split[0]);
+				recolorTextures.Add(split[0], GameDatabase.Instance.GetTexture(split[1].Trim(), false));
+				hasRecolorData = true;
+			}
+			foreach (string s in rec.GetValues("vector")) {
+				string[] split = s.Split(',');
+				if (split.Length < 4) {
+					Debug.LogWarning("[DecouplerShroud] Recolor vector value has too few parameters: " + s);
+					continue;
+				}
+				//The fourth component is optional, older configs only list x/y/z
+				float w = split.Length > 4 ? float.Parse(split[4].Trim()) : 0f;
+				RemovePropertyIfExists(recolorVectors, split[0]);
+				recolorVectors.Add(split[0], new Vector4(float.Parse(split[1].Trim()), float.Parse(split[2].Trim()), float.Parse(split[3].Trim()), w));
+				hasRecolorData = true;
+			}
 		}
 
 		void RemovePropertyIfExists<T>(Dictionary<string, T> dict, string name) {
@@ -299,6 +379,14 @@ namespace DecouplerShroud {
 				if (m.HasProperty(t.Key)) {
 					m.SetTextureScale(t.Key, uvScale);
 					
+					if (autoCenterHeightAroundMiddle) {
+						m.SetTextureOffset(t.Key, new Vector2(0, 0.5f - uvScale.y / 2));
+					}
+				}
+			}
+			foreach (KeyValuePair<string, Texture> t in recolorTextures) {
+				if (m.HasProperty(t.Key)) {
+					m.SetTextureScale(t.Key, uvScale);
 					if (autoCenterHeightAroundMiddle) {
 						m.SetTextureOffset(t.Key, new Vector2(0, 0.5f - uvScale.y / 2));
 					}

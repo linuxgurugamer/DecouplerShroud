@@ -1,5 +1,7 @@
-using KSP.Localization;
+﻿using KSP.Localization;
 using System;
+using System.Collections.Generic;
+using System.Reflection;
 using UnityEngine;
 using UniversalStorage2;
 
@@ -54,6 +56,19 @@ namespace DecouplerShroud
         [KSPField(isPersistant = true)]
         public string textureName;
 
+        //True when the shroud uses the TURD recolour variant of the selected texture
+        [KSPField(isPersistant = true)]
+        public bool turdRecolor = false;
+
+        //Pure single-colour textures: repainting them looks the same as the
+        //plain version, so they get no recolour entry in the texture dropdown
+        static readonly string[] NoRecolourVariant = { "Dark", "Metallic" };
+
+        //GameDatabase url of the player's flag shown on the outside of the shroud.
+        //Empty means "no flag", in that case the regular texture is used.
+        [KSPField(isPersistant = true)]
+        public string shroudFlagURL = "";
+
         [KSPField(isPersistant = false)]
         public float defaultBotWidth = 0;
         [KSPField(isPersistant = false)]
@@ -98,6 +113,27 @@ namespace DecouplerShroud
         //Needed to call updateTexture a few times after changing segment count
         //otherwise the transparency of the outside shroud is constant for some reason
         int Fix_SegmentChangedCallUpdateTexture = 0;
+
+        // TURD / TexturesUnlimited integration
+        // Two KSPTextureSwitch sections live on the part: "Shroud" is the colour
+        // data holder for the procedural shroud (painted by this module), "Ring"
+        // is a normal TURD recolour of the static ring mesh handled by TU itself.
+        const string TU_SHROUD_SECTION = "Shroud";
+        const string TU_RING_SECTION = "Ring";
+
+        //Fallback colour source when the part carries no KSPTextureSwitch
+        const string DS_SHROUD_TEXTURE_SET = "DS_Shroud_Paint";
+
+        PartModule shroudTUSwitch;
+        PartModule ringTUSwitch;
+        PartModule tuRecolorGUI;
+        static bool tuAssemblyChecked = false;
+        static bool tuInstalled = false;
+        Color cachedMainColor = Color.white;
+        Color cachedSecondColor = Color.white;
+        Color cachedDetailColor = Color.white;
+        bool cachedTUColorsValid = false;
+        float nextTUPollTime = 0f;
 
         //true when decoupler has no grandparent in the editor and automatic size detection is active
         [KSPField(isPersistant = true)]
@@ -151,6 +187,8 @@ namespace DecouplerShroud
             Fields[nameof(segmentIndex)].guiName = Localizer.Format("#LOC_DecouplerShroud_16");
             Fields[nameof(textureIndex)].guiName = Localizer.Format("#LOC_DecouplerShroud_17");
 
+            UpdateFlagButtonName();
+
 
 
             //Set up events
@@ -201,6 +239,12 @@ namespace DecouplerShroud
                 if (part.isAttached && shroudEnabled)
                 {
                     detectRequiredRecalculation();
+                    // Throttle TURD polling to avoid per-frame reflection + material churn
+                    if (Time.realtimeSinceStartup >= nextTUPollTime)
+                    {
+                        nextTUPollTime = Time.realtimeSinceStartup + 0.25f;
+                        PollTURDState();
+                    }
                     UpdateMaterialsOpacity();
 
                 }
@@ -344,22 +388,57 @@ namespace DecouplerShroud
                 ShroudTexture.LoadTextures();
             }
 
-            if (textureIndex >= ShroudTexture.shroudTextures.Count)
+            int count = ShroudTexture.shroudTextures.Count;
+            if (count == 0)
             {
-                textureIndex = 0;
+                return;
             }
 
-            string[] options = new string[ShroudTexture.shroudTextures.Count];
-            for (int i = 0; i < options.Length; i++)
-            {
-                options[i] = ShroudTexture.shroudTextures[i].displayName;
+            //With TURD installed the field lists every texture first and then
+            //each texture's recolour variant, so the recolour switch lives here
+            bool tu = IsTUInstalled();
 
-                //Sets textureindex to the saved texture
-                if (options[i].Equals(textureName))
+            string recolour = Localizer.Format("#LOC_DecouplerShroud_18");
+            //Pure single-colour textures (Dark, Metallic, ...) get no recolour
+            //variant: changing their colours cannot produce a different look
+            List<int> recolourTargets = new List<int>();
+            for (int i = 0; i < count; i++)
+            {
+                if (tu && HasRecolourVariant(ShroudTexture.shroudTextures[i].name))
                 {
-                    textureIndex = i;
+                    recolourTargets.Add(i);
                 }
             }
+
+            int total = count + recolourTargets.Count;
+            string[] options = new string[total];
+            int baseIndex = 0;
+            int recolourIndex = -1;
+
+            for (int i = 0; i < count; i++)
+            {
+                string name = ShroudTexture.shroudTextures[i].displayName;
+
+                options[i] = name;
+
+                int pos = recolourTargets.IndexOf(i);
+                if (pos >= 0)
+                {
+                    //Same wording as the TURD stock patches: "<texture> recolor"
+                    options[count + pos] = name + " " + recolour;
+                }
+
+                //Sets textureindex to the saved texture
+                if (ShroudTexture.shroudTextures[i].name.Equals(textureName))
+                {
+                    baseIndex = i;
+                    recolourIndex = pos;
+                }
+            }
+
+            textureIndex = tu && turdRecolor && recolourIndex >= 0
+                ? Mathf.Clamp(count + recolourIndex, 0, total - 1)
+                : Mathf.Clamp(baseIndex, 0, total - 1);
 
             BaseField textureField = Fields[nameof(textureIndex)];
             UI_ChooseOption textureOptions = (UI_ChooseOption)textureField.uiControlEditor;
@@ -373,6 +452,7 @@ namespace DecouplerShroud
             setButtonActive();
             detectSize();
             updateShroud();
+            UpdateFlagButtonName();
         }
 
         //Executes when amount of segments is changed
@@ -388,6 +468,9 @@ namespace DecouplerShroud
         //Disables and reenables stock engine shrouds
         void setEngineShroudActivity()
         {
+            if (!shroudEnabled)
+                return;
+
             Part topPart = GetShroudedPart();
 
             if (topPart != null)
@@ -395,20 +478,10 @@ namespace DecouplerShroud
                 engineShrouds = topPart.GetComponents<ModuleJettison>();
                 if (engineShrouds.Length > 0)
                 {
-                    if (shroudEnabled)
+                    turnedOffEngineShroud = engineShrouds[0].shroudHideOverride;
+                    foreach (ModuleJettison engineShroud in engineShrouds)
                     {
-                        turnedOffEngineShroud = engineShrouds[0].shroudHideOverride;
-                        foreach (ModuleJettison engineShroud in engineShrouds)
-                        {
-                            engineShroud.shroudHideOverride = true;
-                        }
-                    }
-                    else
-                    {
-                        foreach (ModuleJettison engineShroud in engineShrouds)
-                        {
-                            engineShroud.shroudHideOverride = turnedOffEngineShroud;
-                        }
+                        engineShroud.shroudHideOverride = true;
                     }
                 }
             }
@@ -454,19 +527,82 @@ namespace DecouplerShroud
             }
 
             Events[nameof(Jettison)].guiActive = !jettisoned && shroudEnabled && (segments > 1);
+            UpdateTUModuleVisibility();
             //Debug.Log("set jettison gui to: "+ (!jettisoned && shroudEnabled && (segments > 1)) +", "+jettisoned+", "+shroudEnabled+", "+(segments>1)+", "+segments);
         }
 
         void changeMaterial(object arg) { changeMaterial(); }
         void changeMaterial()
         {
-            ShroudTexture shroudTex = ShroudTexture.shroudTextures[textureIndex];
+            //The texture field holds every texture followed by every recolour
+            //variant, so anything past the plain textures is a recolour variant
+            int texCount = ShroudTexture.shroudTextures != null ? ShroudTexture.shroudTextures.Count : 0;
+            turdRecolor = IsTUInstalled() && texCount > 0 && textureIndex >= texCount;
+
+            ShroudTexture shroudTex = ShroudTexture.shroudTextures[GetBaseTextureIndex()];
 
             //save current textures name
             textureName = shroudTex.name;
             CreateMaterials(shroudTex);
 
+            UpdateTUModuleVisibility();
+            //The flag button only exists for the LogoHawk7 texture, so its
+            //visibility has to follow the texture switch
+            UpdateFlagButtonName();
             updateTextureScale();
+        }
+
+        //Maps the shroud texture dropdown index back to the index in ShroudTexture.shroudTextures.
+        //Recolour entries sit behind the plain list, but only recolourable
+        //textures occupy a slot there, so the mapping is sparse.
+        int GetBaseTextureIndex()
+        {
+            var list = ShroudTexture.shroudTextures;
+            int count = list != null ? list.Count : 0;
+            if (count == 0)
+            {
+                return 0;
+            }
+            if (textureIndex < count)
+            {
+                return Mathf.Clamp(textureIndex, 0, count - 1);
+            }
+            int n = textureIndex - count;
+            for (int i = 0; i < count; i++)
+            {
+                if (!HasRecolourVariant(list[i].name))
+                {
+                    continue;
+                }
+                if (n == 0)
+                {
+                    return i;
+                }
+                n--;
+            }
+            return count - 1;
+        }
+
+        static bool HasRecolourVariant(string textureName)
+        {
+            return Array.IndexOf(NoRecolourVariant, textureName) < 0;
+        }
+
+        static bool IsTUInstalled()
+        {
+            if (!tuAssemblyChecked)
+            {
+                tuAssemblyChecked = true;
+                foreach (AssemblyLoader.LoadedAssembly a in AssemblyLoader.loadedAssemblies)
+                {
+                    if (a.name == "TexturesUnlimited")
+                    {
+                        tuInstalled = true;
+                        break;
+                    }
+                }
+            }
+            return tuInstalled;
         }
 
         void updateTextureScale()
@@ -483,7 +619,7 @@ namespace DecouplerShroud
                 return;
             }
 
-            ShroudTexture shroudTex = ShroudTexture.shroudTextures[textureIndex];
+            ShroudTexture shroudTex = ShroudTexture.shroudTextures[GetBaseTextureIndex()];
 
             Vector2 sideSize = new Vector2(Mathf.Max(botWidth, topWidth), new Vector2(height, topWidth - botWidth).magnitude);
             Vector2 topSize = new Vector2(topWidth, topWidth * thickness);
@@ -491,6 +627,9 @@ namespace DecouplerShroud
             shroudTex.textures[0].SetTextureScale(shroudMats[0], sideSize);
             shroudTex.textures[1].SetTextureScale(shroudMats[1], topSize);
             shroudTex.textures[2].SetTextureScale(shroudMats[2], sideSize);
+
+            //Has to come after the calls above, they would reset the flag's tiling
+            ApplyFlagTexture();
 
             if (shroudGO == null)
             {
@@ -526,12 +665,27 @@ namespace DecouplerShroud
             }
             shroudMats = new Material[3];
 
+            bool useTURD = IsShroudTUPaintMode();
+
             for (int i = 0; i < shroudMats.Length; i++)
             {
 
                 SurfaceTexture surf = shroudTex.textures[i];
 
-                shroudMats[i] = Instantiate(surf.mat);
+                if (useTURD)
+                {
+                    surf.EnsureDefaultRecolorData(GetDefaultRecolorMaskColor(i));
+                    shroudMats[i] = surf.CreateTURecolorMaterial();
+                    if (shroudMats[i] == null)
+                    {
+                        shroudMats[i] = Instantiate(surf.mat);
+                    }
+                }
+                else
+                {
+                    shroudMats[i] = Instantiate(surf.mat);
+                }
+
                 shroudMats[i].name = Localizer.Format("#LOC_DecouplerShroud_3") + i + ", " + segments + Localizer.Format("#LOC_DecouplerShroud_4");
 
                 if (HighLogic.LoadedSceneIsEditor)
@@ -541,6 +695,784 @@ namespace DecouplerShroud
                 }
             }
 
+            if (useTURD)
+            {
+                ApplyTUColorsToShroudMats();
+            }
+
+            ApplyFlagTexture();
+        }
+
+        bool IsShroudTUPaintMode()
+        {
+            if (!IsTUInstalled() || !turdRecolor)
+            {
+                return false;
+            }
+            //The KSPTextureSwitch section is only a colour source of truth. When
+            //a part has no TURD patch the shroud still gets the TU material, it
+            //just falls back to the texture set's default colours.
+            InitTUModules();
+            return true;
+        }
+
+        void InitTUModules()
+        {
+            if (shroudTUSwitch == null || ringTUSwitch == null)
+            {
+                foreach (PartModule m in part.Modules)
+                {
+                    if (m.moduleName != "KSPTextureSwitch")
+                        continue;
+                    try
+                    {
+                        BaseField sf = m.Fields["sectionName"];
+                        string section = sf == null ? null : sf.GetValue<string>(m);
+                        if (section == TU_SHROUD_SECTION && shroudTUSwitch == null)
+                        {
+                            shroudTUSwitch = m;
+                        }
+                        else if (section == TU_RING_SECTION && ringTUSwitch == null)
+                        {
+                            ringTUSwitch = m;
+                        }
+                    }
+                    catch { }
+                }
+            }
+
+            if (tuRecolorGUI == null)
+            {
+                foreach (PartModule m in part.Modules)
+                {
+                    if (m.moduleName == "SSTURecolorGUI")
+                    {
+                        tuRecolorGUI = m;
+                        break;
+                    }
+                }
+            }
+        }
+
+        string GetShroudTUSet()
+        {
+            if (shroudTUSwitch == null)
+                return null;
+            try
+            {
+                BaseField f = shroudTUSwitch.Fields["currentTextureSet"];
+                return f.GetValue<string>(shroudTUSwitch);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        Color GetDefaultRecolorMaskColor(int surfaceIndex)
+        {
+            switch (surfaceIndex)
+            {
+                case 0: return new Color(1f, 0f, 0f, 1f);   // outside -> primary (R)
+                case 1: return new Color(0f, 1f, 0f, 1f);   // top -> secondary (G)
+                default: return new Color(0f, 0f, 1f, 1f);  // inside -> detail (B)
+            }
+        }
+
+        void UpdateTUModuleVisibility()
+        {
+            if (!IsTUInstalled())
+            {
+                return;
+            }
+
+            InitTUModules();
+
+            //Both switches only ever hold one texture set, so there is nothing
+            //to pick in them: the shroud variant is chosen in the shroud texture
+            //dropdown and the ring is always recolourable. Hide them from the PAW.
+            HideModuleFromPAW(shroudTUSwitch);
+            HideModuleFromPAW(ringTUSwitch);
+
+            //The recolouring GUI drives the ring row as well, so it stays
+            //available whenever TURD is installed, not only in recolour mode.
+            bool showRecolor = HighLogic.LoadedSceneIsEditor;
+            if (tuRecolorGUI != null)
+            {
+                try
+                {
+                    foreach (BaseField f in tuRecolorGUI.Fields)
+                    {
+                        f.guiActiveEditor = showRecolor;
+                        f.guiActive = false;
+                    }
+                    foreach (BaseEvent e in tuRecolorGUI.Events)
+                    {
+                        e.guiActiveEditor = showRecolor;
+                        e.guiActive = false;
+                    }
+                }
+                catch { }
+            }
+        }
+
+        static void HideModuleFromPAW(PartModule module)
+        {
+            if (module == null)
+            {
+                return;
+            }
+            try
+            {
+                foreach (BaseField f in module.Fields)
+                {
+                    f.guiActiveEditor = false;
+                    f.guiActive = false;
+                }
+                foreach (BaseEvent e in module.Events)
+                {
+                    e.guiActiveEditor = false;
+                    e.guiActive = false;
+                }
+            }
+            catch { }
+        }
+
+        struct TUChannelColor
+        {
+            public Color color;
+            public float specular;
+            public float metallic;
+            public float detail;
+        }
+
+        // Reads the current recolour colours from the KSPTextureSwitch module via the
+        // KSPShaderTools.IRecolorable interface (getSectionColors). This is the source of
+        // truth TU uses to recolour meshes, so the procedural shroud matches the ring.
+        bool TryGetTUChannelColors(out TUChannelColor[] channels)
+        {
+            channels = null;
+            if (shroudTUSwitch == null)
+                return false;
+
+            try
+            {
+                MethodInfo getSectionColors = null;
+                foreach (Type iface in shroudTUSwitch.GetType().GetInterfaces())
+                {
+                    if (iface.Name == "IRecolorable")
+                    {
+                        getSectionColors = iface.GetMethod("getSectionColors");
+                        break;
+                    }
+                }
+                if (getSectionColors == null)
+                    return false;
+
+                string sectionName = "";
+                try
+                {
+                    BaseField sf = shroudTUSwitch.Fields["sectionName"];
+                    if (sf != null)
+                        sectionName = sf.GetValue<string>(shroudTUSwitch);
+                }
+                catch { }
+
+                object result = getSectionColors.Invoke(shroudTUSwitch, new object[] { sectionName });
+                Array arr = result as Array;
+                if (arr == null || arr.Length < 3)
+                    return false;
+
+                channels = new TUChannelColor[3];
+                for (int i = 0; i < 3; i++)
+                {
+                    channels[i] = ReadTUChannel(arr.GetValue(i));
+                }
+                return true;
+            }
+            catch { }
+            return false;
+        }
+
+        TUChannelColor ReadTUChannel(object data)
+        {
+            TUChannelColor c = new TUChannelColor();
+            c.color = Color.white;
+            c.specular = 0f;
+            c.metallic = 0f;
+            c.detail = 1f;
+            if (data == null)
+                return c;
+            try
+            {
+                Type t = data.GetType();
+                FieldInfo cf = t.GetField("color");
+                if (cf != null) { object v = cf.GetValue(data); if (v is Color) c.color = (Color)v; }
+                FieldInfo sf = t.GetField("specular");
+                if (sf != null) { object v = sf.GetValue(data); if (v is float) c.specular = (float)v; }
+                FieldInfo mf = t.GetField("metallic");
+                if (mf != null) { object v = mf.GetValue(data); if (v is float) c.metallic = (float)v; }
+                FieldInfo df = t.GetField("detail");
+                if (df != null) { object v = df.GetValue(data); if (v is float) c.detail = (float)v; }
+            }
+            catch { }
+            return c;
+        }
+
+        // Fallback: read the default colours declared in the active KSP_TEXTURE_SET's
+        // COLORS block (mainColor/secondColor/detailColor = preset names).
+        bool TryGetTUDefaultColors(string setName, out TUChannelColor[] channels)
+        {
+            channels = null;
+            if (string.IsNullOrEmpty(setName))
+                return false;
+
+            foreach (ConfigNode n in GameDatabase.Instance.GetConfigNodes("KSP_TEXTURE_SET"))
+            {
+                if (n.GetValue("name") != setName)
+                    continue;
+                ConfigNode colors = n.GetNode("COLORS");
+                if (colors == null)
+                    return false;
+
+                channels = new TUChannelColor[3];
+                Color c0, c1, c2;
+                if (!ResolveTUPresetColor(colors.GetValue("mainColor"), out c0)) c0 = Color.white;
+                if (!ResolveTUPresetColor(colors.GetValue("secondColor"), out c1)) c1 = Color.white;
+                if (!ResolveTUPresetColor(colors.GetValue("detailColor"), out c2)) c2 = Color.white;
+                for (int i = 0; i < 3; i++)
+                {
+                    channels[i].specular = 0f;
+                    channels[i].metallic = 0f;
+                    channels[i].detail = 1f;
+                }
+                channels[0].color = c0;
+                channels[1].color = c1;
+                channels[2].color = c2;
+                return true;
+            }
+            return false;
+        }
+
+        bool ResolveTUPresetColor(string name, out Color color)
+        {
+            color = Color.white;
+            if (string.IsNullOrEmpty(name))
+                return false;
+
+            foreach (ConfigNode n in GameDatabase.Instance.GetConfigNodes("KSP_COLOR_PRESET"))
+            {
+                if (n.GetValue("name") != name)
+                    continue;
+                string rgb = n.GetValue("color");
+                if (string.IsNullOrEmpty(rgb))
+                    continue;
+                string[] p = rgb.Split(',');
+                if (p.Length >= 3)
+                {
+                    float r, g, b;
+                    if (float.TryParse(p[0].Trim(), out r) && float.TryParse(p[1].Trim(), out g) && float.TryParse(p[2].Trim(), out b))
+                    {
+                        color = new Color(r / 255f, g / 255f, b / 255f);
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        void ApplyTUColorsToShroudMats()
+        {
+            if (shroudMats == null)
+                return;
+
+            TUChannelColor[] channels;
+            if (!TryGetTUChannelColors(out channels))
+            {
+                if (!TryGetTUDefaultColors(GetShroudTUSet(), out channels))
+                {
+                    if (!TryGetTUDefaultColors(DS_SHROUD_TEXTURE_SET, out channels))
+                        return;
+                }
+            }
+
+            cachedMainColor = channels[0].color;
+            cachedSecondColor = channels[1].color;
+            cachedDetailColor = channels[2].color;
+            cachedTUColorsValid = true;
+
+            foreach (Material m in shroudMats)
+            {
+                if (m == null)
+                    continue;
+
+                // TU/Metallic recolour properties: RGB = colour, A = specular
+                Color c0 = channels[0].color; c0.a = channels[0].specular;
+                Color c1 = channels[1].color; c1.a = channels[1].specular;
+                Color c2 = channels[2].color; c2.a = channels[2].specular;
+                if (m.HasProperty("_MaskColor1"))
+                    m.SetColor("_MaskColor1", c0);
+                if (m.HasProperty("_MaskColor2"))
+                    m.SetColor("_MaskColor2", c1);
+                if (m.HasProperty("_MaskColor3"))
+                    m.SetColor("_MaskColor3", c2);
+                if (m.HasProperty("_MaskMetallic"))
+                    m.SetColor("_MaskMetallic", new Color(channels[0].metallic, channels[1].metallic, channels[2].metallic, 0f));
+                if (m.HasProperty("_DetailMult"))
+                    m.SetVector("_DetailMult", new Vector4(channels[0].detail, channels[1].detail, channels[2].detail, 0f));
+            }
+        }
+
+        void PollTURDState()
+        {
+            if (!HighLogic.LoadedSceneIsEditor || !shroudEnabled)
+                return;
+
+            if (!IsShroudTUPaintMode())
+                return;
+
+            TUChannelColor[] channels;
+            if (!TryGetTUChannelColors(out channels))
+                return;
+
+            Color main = channels[0].color;
+            Color second = channels[1].color;
+            Color detail = channels[2].color;
+            if (!cachedTUColorsValid || main != cachedMainColor || second != cachedSecondColor || detail != cachedDetailColor)
+            {
+                ApplyTUColorsToShroudMats();
+            }
+        }
+
+        //----------------------------------------------------------------------
+        // Shroud flag
+        //
+        // The player can put one of the game's own flags on the outside of the
+        // shroud. KSP's own FlagBrowser MonoBehaviour is reused for the picking,
+        // so the window is the stock flag picker.
+        //
+        // FlagBrowser builds its dialog from Start(): it reads the flag folders
+        // out of GameDatabase and calls PopupDialog.SpawnPopupDialog. All that
+        // is needed is to add the component to a GameObject and fill in its
+        // public OnFlagSelected callback - Unity calls Start() on the next frame
+        // and the browser opens. The callback type is the nested
+        // FlagBrowser.FlagSelectedCallback, so the delegate is built through
+        // reflection from a handler that takes the entry as object.
+        //----------------------------------------------------------------------
+
+        GameObject flagBrowserHost;
+        //Kept so the flag can be applied even when its url cannot be resolved
+        //again through GameDatabase (only valid for the current session)
+        Texture2D pickedFlagTexture;
+
+        //The flag replaces only the logo artwork on the LogoHawk7 texture (the
+        //same spot the stock hawk/logo art occupies), so the picker is only
+        //offered while that texture or its recolour variant is active.
+        const string FlagLogoTextureName = "LogoHawk7";
+        //Logo area on LogoHawk7.png in top-down pixel coordinates: the blank
+        //panel centre (the hawk/"7"/flag artwork was removed from the texture).
+        //Must match the black (recolour protected) area of LogoHawk7_RGB, see
+        //tools/make_rgb_masks.py
+        const int LogoRectX = 96, LogoRectY = 168, LogoRectW = 320, LogoRectH = 176;
+        static Texture2D logoBaseTexture;
+        static readonly Dictionary<string, Texture2D> flagCompositeCache = new Dictionary<string, Texture2D>();
+        static readonly Dictionary<string, Texture2D> flagMaskCache = new Dictionary<string, Texture2D>();
+
+        [KSPEvent(guiName = "#LOC_DecouplerShroud_19", guiActive = false, guiActiveEditor = true)]
+        public void selectShroudFlag()
+        {
+            OpenFlagBrowser();
+        }
+
+        void OpenFlagBrowser()
+        {
+            try
+            {
+                if (flagBrowserHost != null)
+                {
+                    Destroy(flagBrowserHost);
+                    flagBrowserHost = null;
+                }
+
+                GameObject host = new GameObject("DecouplerShroudFlagBrowser");
+                flagBrowserHost = host;
+
+                FlagBrowser browser = host.AddComponent<FlagBrowser>();
+
+                FieldInfo selected = typeof(FlagBrowser).GetField("OnFlagSelected", BindingFlags.Instance | BindingFlags.Public);
+                if (selected == null)
+                {
+                    Debug.LogWarning("[DecouplerShroud] FlagBrowser.OnFlagSelected was not found");
+                    return;
+                }
+
+                MethodInfo handler = typeof(ModuleDecouplerShroud).GetMethod(nameof(onFlagPicked), BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                selected.SetValue(browser, Delegate.CreateDelegate(selected.FieldType, this, handler));
+
+                FieldInfo dismissed = typeof(FlagBrowser).GetField("OnDismiss", BindingFlags.Instance | BindingFlags.Public);
+                if (dismissed != null)
+                {
+                    MethodInfo cancel = typeof(ModuleDecouplerShroud).GetMethod(nameof(onFlagCancelled), BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    dismissed.SetValue(browser, Delegate.CreateDelegate(dismissed.FieldType, this, cancel));
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[DecouplerShroud] Failed to open the flag browser: " + e);
+            }
+        }
+
+        //Called by KSP's flag browser with the picked FlagBrowser.FlagEntry. The
+        //parameter is object because that nested type cannot be named here.
+        void onFlagPicked(object entry)
+        {
+            pickedFlagTexture = ExtractFlagTexture(entry);
+            SetShroudFlag(ExtractFlagUrl(entry));
+            CloseFlagBrowserHost();
+        }
+
+        void onFlagCancelled()
+        {
+            CloseFlagBrowserHost();
+        }
+
+        void CloseFlagBrowserHost()
+        {
+            if (flagBrowserHost == null)
+            {
+                return;
+            }
+            //Delayed so the browser still finishes its own Accept()/Dismiss()
+            Destroy(flagBrowserHost, 0.25f);
+            flagBrowserHost = null;
+        }
+
+        //FlagBrowser.FlagEntry holds a GameDatabase.TextureInfo whose name is the
+        //GameDatabase url of the flag.
+        static string ExtractFlagUrl(object entry)
+        {
+            if (entry == null)
+            {
+                return null;
+            }
+            try
+            {
+                FieldInfo ti = entry.GetType().GetField("textureInfo", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                object info = ti == null ? null : ti.GetValue(entry);
+                if (info == null)
+                {
+                    return null;
+                }
+
+                foreach (FieldInfo nf in info.GetType().GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+                {
+                    if (nf.FieldType != typeof(string))
+                    {
+                        continue;
+                    }
+                    string s = nf.GetValue(info) as string;
+                    if (!string.IsNullOrEmpty(s))
+                    {
+                        return s;
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[DecouplerShroud] Could not read the picked flag: " + e);
+            }
+            return null;
+        }
+
+        static Texture2D ExtractFlagTexture(object entry)
+        {
+            if (entry == null)
+            {
+                return null;
+            }
+            try
+            {
+                FieldInfo ti = entry.GetType().GetField("textureInfo", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                object info = ti == null ? null : ti.GetValue(entry);
+                if (info == null)
+                {
+                    return null;
+                }
+                FieldInfo tf = info.GetType().GetField("texture", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                return tf == null ? null : tf.GetValue(info) as Texture2D;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        void SetShroudFlag(string url)
+        {
+            if (string.IsNullOrEmpty(url) || url.Equals(shroudFlagURL))
+            {
+                return;
+            }
+
+            shroudFlagURL = url;
+            UpdateFlagButtonName();
+            changeMaterial();
+        }
+
+        void UpdateFlagButtonName()
+        {
+            BaseEvent flagEvent = Events[nameof(selectShroudFlag)];
+            if (flagEvent == null)
+            {
+                return;
+            }
+
+            string label = Localizer.Format("#LOC_DecouplerShroud_19");
+            string current = string.IsNullOrEmpty(shroudFlagURL)
+                ? Localizer.Format("#LOC_DecouplerShroud_20")
+                : FlagDisplayName(shroudFlagURL);
+
+            flagEvent.guiName = label + ": " + current;
+            //Only the LogoHawk7 texture has an artwork area to fill
+            flagEvent.guiActiveEditor = shroudEnabled && IsLogoShroudTexture();
+            flagEvent.guiActive = false;
+        }
+
+        static string FlagDisplayName(string url)
+        {
+            int i = url.LastIndexOf('/');
+            return i >= 0 && i < url.Length - 1 ? url.Substring(i + 1) : url;
+        }
+
+        //Puts the picked flag only into the logo area of the LogoHawk7 texture.
+        //The recolour mask is rebuilt alongside it: black (= protected) covers
+        //exactly the painted flag pixels, so the flag keeps its own colours
+        //while the whole panel around it follows the TURD colours.
+        void ApplyFlagTexture()
+        {
+            if (shroudMats == null || shroudMats.Length == 0 || shroudMats[0] == null)
+            {
+                return;
+            }
+            if (string.IsNullOrEmpty(shroudFlagURL) || !IsLogoShroudTexture())
+            {
+                return;
+            }
+
+            Texture2D composite, mask;
+            GetFlagComposite(out composite, out mask);
+            if (composite == null)
+            {
+                return;
+            }
+
+            //Same layout as LogoHawk7, so the material keeps its own tiling.
+            shroudMats[0].SetTexture("_MainTex", composite);
+            if (mask != null)
+            {
+                shroudMats[0].SetTexture("_MaskTex", mask);
+            }
+            //The TU/Metallic shader reads _MetallicGlossMap for the protected
+            //(mask-black) area, and the stock config points it at LogoHawk7.png
+            //itself: its grey pixels act as metallic (~0.65) and its missing
+            //alpha as full smoothness -- the flag renders as a polished mirror.
+            shroudMats[0].SetTexture("_MetallicGlossMap", MatteGlossMap());
+        }
+
+        static Texture2D matteGlossMap;
+
+        //Constant matte, non-metallic gloss map for the flag area.
+        static Texture2D MatteGlossMap()
+        {
+            if (matteGlossMap == null)
+            {
+                matteGlossMap = new Texture2D(4, 4, TextureFormat.RGBA32, false);
+                matteGlossMap.wrapMode = TextureWrapMode.Repeat;
+                Color[] px = new Color[16];
+                Color matte = new Color(0f, 0f, 0f, 0.25f);
+                for (int i = 0; i < px.Length; i++)
+                {
+                    px[i] = matte;
+                }
+                matteGlossMap.SetPixels(px);
+                matteGlossMap.Apply(false, false);
+            }
+            return matteGlossMap;
+        }
+
+        bool IsLogoShroudTexture()
+        {
+            var list = ShroudTexture.shroudTextures;
+            int i = GetBaseTextureIndex();
+            return list != null && i >= 0 && i < list.Count
+                && list[i].name.Equals(FlagLogoTextureName);
+        }
+
+        //Builds the flag albedo composite and the matching recolour mask in one
+        //pass. The albedo has the flag blended into the logo area; the mask is
+        //pure PRIMARY except the painted flag pixels, which are BLACK. Only
+        //actual flag pixels are protected, so a transparent PNG does not leave
+        //a bare base-texture patch behind on a recoloured shroud.
+        void GetFlagComposite(out Texture2D albedo, out Texture2D mask)
+        {
+            albedo = null;
+            mask = null;
+
+            Texture2D cached;
+            if (flagCompositeCache.TryGetValue(shroudFlagURL, out cached) && cached != null)
+            {
+                albedo = cached;
+                flagMaskCache.TryGetValue(shroudFlagURL, out mask);
+                return;
+            }
+
+            Texture2D flag = pickedFlagTexture != null ? pickedFlagTexture : GameDatabase.Instance.GetTexture(shroudFlagURL, false);
+            if (flag == null)
+            {
+                Debug.LogWarning("[DecouplerShroud] Shroud flag not found in GameDatabase: " + shroudFlagURL);
+                return;
+            }
+
+            Texture2D baseTex = LoadLogoBase();
+            if (baseTex == null)
+            {
+                return;
+            }
+
+            //Players drop flags in every aspect ratio there is, so keep the
+            //flag's own shape, fit it inside the logo area and centre it.
+            float fit = Mathf.Min((float)LogoRectW / flag.width, (float)LogoRectH / flag.height);
+            int blockW = Mathf.Max(1, Mathf.RoundToInt(flag.width * fit));
+            int blockH = Mathf.Max(1, Mathf.RoundToInt(flag.height * fit));
+            int blockX = LogoRectX + (LogoRectW - blockW) / 2;
+            int blockTop = LogoRectY + (LogoRectH - blockH) / 2;
+
+            Texture2D block = ScaledFlagBlock(flag, blockW, blockH);
+            if (block == null)
+            {
+                return;
+            }
+
+            albedo = new Texture2D(baseTex.width, baseTex.height, TextureFormat.RGBA32, false);
+            Color[] pixels = baseTex.GetPixels();
+            Color[] flagPixels = block.GetPixels();
+            //LogoRectY is in top-down (image) coordinates while Unity textures
+            //are bottom-up, so flip the rectangle vertically.
+            int destY = baseTex.height - blockTop - blockH;
+            BlendFlagBlock(pixels, baseTex.width, flagPixels, blockW, blockH, blockX, destY);
+            albedo.SetPixels(pixels);
+            albedo.Apply(false, false);
+
+            mask = new Texture2D(baseTex.width, baseTex.height, TextureFormat.RGBA32, false);
+            Color[] maskPixels = new Color[pixels.Length];
+            Color primary = new Color(1f, 0f, 0f, 1f);
+            for (int i = 0; i < maskPixels.Length; i++)
+            {
+                maskPixels[i] = primary;
+            }
+            for (int row = 0; row < blockH; row++)
+            {
+                int destRow = (destY + row) * baseTex.width + blockX;
+                int flagRow = row * blockW;
+
+                for (int column = 0; column < blockW; column++)
+                {
+                    if (flagPixels[flagRow + column].a > 0f)
+                    {
+                        maskPixels[destRow + column] = Color.black;
+                    }
+                }
+            }
+            mask.SetPixels(maskPixels);
+            mask.Apply(false, false);
+
+            flagCompositeCache[shroudFlagURL] = albedo;
+            flagMaskCache[shroudFlagURL] = mask;
+        }
+
+        //Transparent PNG flags keep their own alpha, so the flag is blended
+        //over the LogoHawk7 base instead of replacing those pixels -- painted
+        //over, every unpainted pixel of the flag turns into a black block.
+        static void BlendFlagBlock(Color[] dest, int destWidth, Color[] flag, int width, int height, int x, int y)
+        {
+            for (int row = 0; row < height; row++)
+            {
+                int destRow = (y + row) * destWidth + x;
+                int flagRow = row * width;
+
+                for (int column = 0; column < width; column++)
+                {
+                    Color f = flag[flagRow + column];
+                    if (f.a <= 0f)
+                    {
+                        continue;
+                    }
+
+                    Color d = dest[destRow + column];
+                    if (f.a < 1f)
+                    {
+                        f.r = Mathf.Lerp(d.r, f.r, f.a);
+                        f.g = Mathf.Lerp(d.g, f.g, f.a);
+                        f.b = Mathf.Lerp(d.b, f.b, f.a);
+                    }
+
+                    f.a = 1f;
+                    dest[destRow + column] = f;
+                }
+            }
+        }
+
+        //Loads LogoHawk7.png into a readable texture (GameDatabase textures and
+        //the runtime-loaded ones are not readable, so this reads the file itself)
+        static Texture2D LoadLogoBase()
+        {
+            if (logoBaseTexture != null)
+            {
+                return logoBaseTexture;
+            }
+            try
+            {
+                string path = KSPUtil.ApplicationRootPath + "GameData/DecouplerShroud/Textures/LogoTextures/LogoHawk7.png";
+                Texture2D tex = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+                if (!tex.LoadImage(System.IO.File.ReadAllBytes(path)))
+                {
+                    Debug.LogWarning("[DecouplerShroud] Could not decode " + path);
+                    Destroy(tex);
+                    return null;
+                }
+                logoBaseTexture = tex;
+                return logoBaseTexture;
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[DecouplerShroud] Could not load LogoHawk7.png: " + e);
+                return null;
+            }
+        }
+
+        //GameDatabase textures are not CPU-readable, so blit through a render
+        //texture to get readable pixels. Scaled here to the logo block size so
+        //ReadPixels also does the resize in one step.
+        static Texture2D ScaledFlagBlock(Texture2D flag, int w, int h)
+        {
+            try
+            {
+                RenderTexture rt = RenderTexture.GetTemporary(w, h, 0, RenderTextureFormat.ARGB32);
+                RenderTexture prev = RenderTexture.active;
+                Graphics.Blit(flag, rt);
+                RenderTexture.active = rt;
+                Texture2D block = new Texture2D(w, h, TextureFormat.RGBA32, false);
+                block.ReadPixels(new Rect(0f, 0f, w, h), 0, 0);
+                block.Apply(false, false);
+                RenderTexture.active = prev;
+                RenderTexture.ReleaseTemporary(rt);
+                return block;
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[DecouplerShroud] Could not copy the flag texture: " + e);
+                return null;
+            }
         }
 
         void partReattached()
@@ -794,7 +1726,7 @@ namespace DecouplerShroud
             if (GetShroudedPart() == null)
             {
                 destroyShroud();
-                if (engineShrouds != null)
+                if (shroudEnabled && engineShrouds != null)
                 {
                     if (engineShrouds.Length > 0)
                     {
