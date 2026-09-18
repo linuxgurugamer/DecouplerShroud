@@ -1,5 +1,9 @@
 Changelog
 
+0.9.2
+	Thanks to github user @tsingshitaeo-nuke:
+		Add turd compatibility
+
 0.9.1.1
 	Added missing localization values for PAW
 	Fixed bug introduced with previous changes causing a nullref in the editor when attaching a node
